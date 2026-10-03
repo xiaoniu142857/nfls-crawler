@@ -43,7 +43,7 @@ import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 DEFAULT_API = "https://nflsoi.cc:20035"
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), ".nflsoj")
@@ -156,8 +156,11 @@ class Console:
     # -- 常用块 -----------------------------------------------------------
     def title(self, text: str) -> None:
         g = self.glyph
-        inner = " " + text + " "
-        pad = max(0, min(self.width, 90) - len_display(inner) - 2)
+        # 总宽固定为 min(width, 90)：文本过长时截断，避免超出终端宽度
+        room = max(1, min(self.width, 90) - 3)
+        inner = " " + truncate(text, max(1, room - 2)) + " "
+        # 左右边框各 1 列、文本两侧各 1 段横线，故总宽 = pad + len(inner) + 3
+        pad = max(0, min(self.width, 90) - len_display(inner) - 3)
         self.out(self.paint(g["tl"] + g["h"] + inner + g["h"] * pad + g["tr"], "bcyan", bold=True))
 
     def subtitle(self, text: str) -> None:
@@ -199,13 +202,16 @@ class Console:
             for i in range(cols):
                 text = row[i][0] if i < len(row) else ""
                 widths[i] = max(widths[i], len_display(text))
-        budget = max_width - (3 * (cols - 1)) - 2
-        if sum(widths) > budget:
+        # 渲染开销：左右边框 2 + 左右各 1 空格 + 列间 " │ " 3*(cols-1)
+        budget = max(0, max_width - (3 * cols + 1))
+        for floor in (12, 4, 1):
             excess = sum(widths) - budget
+            if excess <= 0:
+                break
             for i in sorted(range(cols), key=lambda k: widths[k], reverse=True):
                 if excess <= 0:
                     break
-                take = min(excess, max(0, widths[i] - 12))
+                take = min(excess, max(0, widths[i] - floor))
                 widths[i] -= take
                 excess -= take
 
@@ -253,15 +259,25 @@ def char_width(ch: str) -> int:
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """去掉 ANSI 颜色转义序列，便于按终端可见宽度计算。"""
+    return _ANSI_RE.sub("", text) if "\x1b" in text else text
+
+
 def len_display(text: str) -> int:
-    return sum(char_width(c) for c in text)
+    return sum(char_width(c) for c in strip_ansi(text))
 
 
 def truncate(text: str, width: int) -> str:
-    if len_display(text) <= width:
+    plain = strip_ansi(text)
+    if len_display(plain) <= width:
         return text
+    # 需要截断时丢弃颜色信息，避免把 ANSI 转义序列截半导致“串色”
     out, acc = [], 0
-    for ch in text:
+    for ch in plain:
         w = char_width(ch)
         if acc + w > width - 1:
             break
@@ -531,7 +547,10 @@ class Client:
 
     def current_user(self):
         """返回已登录用户信息，未登录返回 None。"""
-        return self.session_info().get("userMeta") or None
+        info = self.session_info()
+        if not isinstance(info, dict):
+            raise ApiError("服务器返回了非预期的会话信息结构")
+        return info.get("userMeta") or None
 
     def login(self, username: str, password: str):
         return self.request("POST", "/api/auth/login",
@@ -567,6 +586,8 @@ def _first_of(raw: dict, *keys):
 
 def normalize_contest(raw: dict) -> dict:
     """把 getContestList / getContest 返回的比赛规整成统一结构（兼容多种字段名）。"""
+    if not isinstance(raw, dict):
+        raw = {}
     groups = []
     for item in raw.get("groups") or []:
         if isinstance(item, dict):
@@ -594,6 +615,8 @@ def normalize_contest(raw: dict) -> dict:
 
 def extract_problems(detail: dict) -> list:
     """从 getContest(problemInfos=True) 的响应中提取题目列表。"""
+    if not isinstance(detail, dict):
+        return []
     infos = detail.get("problemInfos")
     problems = []
     if isinstance(infos, list):
@@ -650,6 +673,7 @@ class Store:
         self.progress_path = os.path.join(data_dir, "progress.json")
         self.config = {}
         self.progress = {}
+        self.api_override = ""      # 仅本次运行的 --api 覆盖（不写盘）
 
     # -- 文件读写 ---------------------------------------------------------
     def _ensure_dir(self) -> None:
@@ -692,7 +716,7 @@ class Store:
     # -- 凭据 -------------------------------------------------------------
     @property
     def api_base(self) -> str:
-        return self.config.get("baseUrl") or DEFAULT_API
+        return self.api_override or self.config.get("baseUrl") or DEFAULT_API
 
     def set_credentials(self, token: str = "", cookie: str = "", username: str = "",
                         base_url: str = "") -> None:
@@ -776,14 +800,25 @@ class Store:
 # ---------------------------------------------------------------------------
 # 业务逻辑：拉取比赛 / 同步
 # ---------------------------------------------------------------------------
-def require_login(store: Store, console: Console) -> str:
+def client_for(store: Store, args=None) -> Client:
+    """按命令行选项构造 API 客户端（--timeout / --insecure / --debug）。"""
+    options = {}
+    if args is not None:
+        timeout = getattr(args, "timeout", None)
+        if timeout is not None:
+            options["timeout"] = timeout
+        if getattr(args, "insecure", False):
+            options["insecure"] = True
+        if getattr(args, "debug", False):
+            options["debug"] = True
+    return store.client(**options)
+
+
+def require_login(store: Store, console: Console, client: Client = None) -> str:
     """确认已登录并返回用户名。"""
     if not store.api_base:
         raise ApiError("尚未配置站点地址")
-    try:
-        user = store.client().current_user()
-    except ApiError:
-        raise
+    user = (client or store.client()).current_user()
     if not user:
         raise ApiError("尚未登录或登录状态已失效", 401, "请先运行：nflsoj login")
     username = str(user.get("username") or user.get("id") or "unknown")
@@ -794,11 +829,19 @@ def require_login(store: Store, console: Console) -> str:
 
 
 def fetch_all_contests(client: Client, keyword=None, page_size=CONTEST_PAGE_SIZE, on_page=None) -> list:
-    """分页拉取全部比赛。"""
+    """分页拉取全部比赛。
+
+    注意：不能因为某页数量少于 page_size 就停止——部分部署会把 takeCount
+    压得更小；只要服务端给出了总数（count）就按总数继续翻页。
+    """
     contests, skip, total, pages = [], 0, None, 0
     while True:
         data = client.contest_list(skip=skip, take=page_size, keyword=keyword)
+        if not isinstance(data, dict):
+            raise ApiError("服务器返回了非预期的数据结构（期望 JSON 对象）")
         items = data.get("contests") or []
+        if not isinstance(items, list):
+            raise ApiError("服务器返回了非预期的比赛列表结构")
         if total is None and isinstance(data.get("count"), int):
             total = data["count"]
         contests.extend(normalize_contest(item) for item in items)
@@ -806,9 +849,12 @@ def fetch_all_contests(client: Client, keyword=None, page_size=CONTEST_PAGE_SIZE
         pages += 1
         if on_page:
             on_page(len(contests), total)
-        if not items or len(items) < page_size or pages > 500:
+        if not items or pages > 500:
             break
-        if total is not None and len(contests) >= total:
+        if total is not None:
+            if len(contests) >= total:
+                break
+        elif len(items) < page_size:
             break
     return contests
 
@@ -816,6 +862,8 @@ def fetch_all_contests(client: Client, keyword=None, page_size=CONTEST_PAGE_SIZE
 def fetch_contest_detail(client: Client, contest_id) -> tuple:
     """返回 (比赛信息, 题目列表)。"""
     detail = client.contest_detail(contest_id, with_problems=True)
+    if not isinstance(detail, dict):
+        raise ApiError("服务器返回了非预期的比赛详情结构")
     meta = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
     contest = normalize_contest(meta)
     contest["id"] = contest.get("id") or contest_id
@@ -971,12 +1019,15 @@ def cmd_logout(args, store: Store, console: Console) -> int:
 
 def cmd_whoami(args, store: Store, console: Console) -> int:
     try:
-        info = store.client().session_info()
+        info = client_for(store, args).session_info()
     except ApiError as exc:
         return report_error(console, exc)
-    user = info.get("userMeta")
-    server_pref = info.get("serverPreference") or {}
-    version = info.get("serverVersion") or {}
+    info = info if isinstance(info, dict) else {}
+    user = info.get("userMeta") if isinstance(info.get("userMeta"), dict) else None
+    server_pref = info.get("serverPreference")
+    version = info.get("serverVersion")
+    server_pref = server_pref if isinstance(server_pref, dict) else {}
+    version = version if isinstance(version, dict) else {}
     console.title("当前登录状态")
     if not user:
         console.warn("未登录（匿名访问）")
@@ -1018,7 +1069,8 @@ def cmd_config(args, store: Store, console: Console) -> int:
 
 
 def cmd_login(args, store: Store, console: Console) -> int:
-    base_url = (args.api or store.api_base or DEFAULT_API).rstrip("/")
+    timeout = getattr(args, "timeout", None)
+    base_url = (getattr(args, "api", None) or store.api_base or DEFAULT_API).rstrip("/")
     token = args.token or os.environ.get("NFLSOJ_TOKEN", "") or ""
     cookie = args.cookie or ""
     username = args.username or ""
@@ -1064,12 +1116,17 @@ def cmd_login(args, store: Store, console: Console) -> int:
                 return 1
 
     client = Client(base_url=base_url, token=token, cookie=cookie,
-                    insecure=args.insecure, timeout=args.timeout, debug=args.debug)
+                    insecure=getattr(args, "insecure", False),
+                    timeout=timeout if timeout is not None else 30,
+                    debug=getattr(args, "debug", False))
 
     try:
         if username and not token and not cookie:
             console.info("正在使用用户名密码登录…")
             result = client.login(username, password)
+            if not isinstance(result, dict):
+                console.error("登录失败：服务器返回了非预期的响应")
+                return 1
             if result.get("error"):
                 console.error("登录失败：%s" % result["error"])
                 return 1
@@ -1099,13 +1156,11 @@ def cmd_login(args, store: Store, console: Console) -> int:
 # 命令：sync / contests
 # ---------------------------------------------------------------------------
 def cmd_sync(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
-    client = store.client(timeout=args.timeout,
-                          insecure=True if args.insecure else None,
-                          debug=True if args.debug else None)
     console.title("同步比赛与题目列表")
     console.kv("账号", username)
     console.kv("站点", store.api_base)
@@ -1130,15 +1185,13 @@ def cmd_sync(args, store: Store, console: Console) -> int:
 
 
 def cmd_contests(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
 
     if args.live:
-        client = store.client(timeout=args.timeout,
-                              insecure=True if args.insecure else None,
-                              debug=True if args.debug else None)
         console.title("比赛列表（实时）")
         try:
             contests = fetch_all_contests(client, keyword=args.keyword)
@@ -1151,7 +1204,6 @@ def cmd_contests(args, store: Store, console: Console) -> int:
         contests = store.all_contests(username)
         if not contests:
             console.warn("本地还没有比赛数据，正在自动同步一次…")
-            client = store.client(timeout=args.timeout)
             try:
                 contests = fetch_all_contests(client, keyword=args.keyword)
                 for contest in contests:
@@ -1216,7 +1268,8 @@ def cmd_contests(args, store: Store, console: Console) -> int:
 # ---------------------------------------------------------------------------
 # 命令：problems / mark
 # ---------------------------------------------------------------------------
-def _load_contest_entry(store: Store, username: str, spec, console: Console, refresh=False):
+def _load_contest_entry(store: Store, username: str, spec, console: Console, refresh=False,
+                        client: Client = None):
     """找到本地比赛记录；必要时向服务器补拉题目列表。返回 (entry, error_code)。"""
     contest, matches = resolve_contest(store, username, spec)
     if contest is None:
@@ -1233,7 +1286,7 @@ def _load_contest_entry(store: Store, username: str, spec, console: Console, ref
         entry = store.upsert_contest(username, contest, None)
     if refresh or not (entry.get("problems") or []):
         try:
-            meta, problems = fetch_contest_detail(store.client(), contest.get("id"))
+            meta, problems = fetch_contest_detail(client or store.client(), contest.get("id"))
             entry = store.upsert_contest(username, meta, problems)
             store.save_progress()
         except ApiError as exc:
@@ -1245,12 +1298,14 @@ def _load_contest_entry(store: Store, username: str, spec, console: Console, ref
 
 
 def cmd_problems(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
 
-    entry, code = _load_contest_entry(store, username, args.contest, console, refresh=args.refresh)
+    entry, code = _load_contest_entry(store, username, args.contest, console,
+                                      refresh=args.refresh, client=client)
     if entry is None:
         return code
 
@@ -1311,12 +1366,14 @@ def cmd_problems(args, store: Store, console: Console) -> int:
 
 
 def cmd_mark(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
 
-    entry, code = _load_contest_entry(store, username, args.contest, console, refresh=args.refresh)
+    entry, code = _load_contest_entry(store, username, args.contest, console,
+                                      refresh=args.refresh, client=client)
     if entry is None:
         return code
 
@@ -1337,6 +1394,8 @@ def cmd_mark(args, store: Store, console: Console) -> int:
         new_state = STATE_ALIASES[key]
     else:
         current = problem.get("state") or STATE_TODO
+        if current not in STATE_ORDER:      # 兼容被手工改坏的数据
+            current = STATE_TODO
         new_state = STATE_ORDER[(STATE_ORDER.index(current) + 1) % len(STATE_ORDER)]
 
     try:
@@ -1393,8 +1452,9 @@ def collect_stats(contests) -> dict:
 
 
 def cmd_stats(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
 
@@ -1499,8 +1559,9 @@ def cmd_stats(args, store: Store, console: Console) -> int:
 # 命令：open / export
 # ---------------------------------------------------------------------------
 def cmd_open(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
     contest, matches = resolve_contest(store, username, args.contest)
@@ -1546,8 +1607,9 @@ def iter_rows(contests):
 
 
 def cmd_export(args, store: Store, console: Console) -> int:
+    client = client_for(store, args)
     try:
-        username = require_login(store, console)
+        username = require_login(store, console, client)
     except ApiError as exc:
         return report_error(console, exc)
 
@@ -1629,20 +1691,23 @@ EPILOG = """示例：
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # 统一用 SUPPRESS 作为默认值：子解析器会把自身默认值写回命名空间，
+    # 若用 None/False 作默认值，`nflsoj --api X contests` 中的 --api 会被子命令覆盖掉。
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--data-dir", default=None, help="数据目录（默认 %s）" % DEFAULT_DATA_DIR)
-    common.add_argument("--api", default=None, help="站点 API 地址（默认 %s）" % DEFAULT_API)
-    common.add_argument("--timeout", type=int, default=30, help="HTTP 超时秒数（默认 30）")
-    common.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
-    common.add_argument("--debug", action="store_true", help="打印 HTTP 请求细节")
-    common.add_argument("--no-color", action="store_true", help="禁用彩色输出")
-    common.add_argument("--ascii", action="store_true", help="使用纯 ASCII 字符（兼容老终端）")
+    common.add_argument("--data-dir", default=argparse.SUPPRESS, help="数据目录（默认 %s）" % DEFAULT_DATA_DIR)
+    common.add_argument("--api", default=argparse.SUPPRESS, help="站点 API 地址（默认 %s）" % DEFAULT_API)
+    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS, help="HTTP 超时秒数（默认 30）")
+    common.add_argument("--insecure", action="store_true", default=argparse.SUPPRESS, help="跳过 HTTPS 证书校验")
+    common.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help="打印 HTTP 请求细节")
+    common.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="禁用彩色输出")
+    common.add_argument("--ascii", action="store_true", default=argparse.SUPPRESS, help="使用纯 ASCII 字符（兼容老终端）")
 
     parser = argparse.ArgumentParser(
         prog="nflsoj",
         description="NFLSOJ (nflsoi.cc) 命令行工具 —— 登录、爬取比赛与题目、标记做题状态、统计进度。",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[common],
     )
     parser.add_argument("--version", action="version", version="nflsoj %s" % __version__)
     sub = parser.add_subparsers(dest="command")
@@ -1728,7 +1793,7 @@ def cmd_dashboard(args, store: Store, console: Console) -> int:
     console.title("NFLSOJ 命令行工具  v%s" % __version__)
     user = None
     try:
-        user = store.client().current_user()
+        user = client_for(store, args).current_user()
     except ApiError as exc:
         console.warn("无法连接站点：%s" % exc.message)
     if user:
@@ -1800,6 +1865,8 @@ def main(argv=None) -> int:
     data_dir = getattr(args, "data_dir", None) or DEFAULT_DATA_DIR
     store = Store(data_dir)
     store.load()
+    # --api 仅覆盖本次运行使用的地址（login / config 命令会显式写入配置）
+    store.api_override = (getattr(args, "api", None) or "").rstrip("/")
 
     handler = getattr(args, "handler", None) or cmd_dashboard
     try:
