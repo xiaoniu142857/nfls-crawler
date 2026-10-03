@@ -1,0 +1,15 @@
+# nfls-crawler / nflsoj.py —— 第三方依赖清单
+#
+# 本项目（nflsoj.py）仅使用 Python 标准库实现，运行时不依赖任何第三方包，
+# 因此这里没有任何需要通过 pip 安装的条目。安装 Python 3.8+ 后即可直接运行：
+#
+#     python nflsoj.py --help
+#
+# 代码中实际使用的标准库模块（供参考）：
+#   argparse, csv, io, json, os, re, ssl, sys, time, unicodedata, webbrowser,
+#   urllib.error, urllib.parse, urllib.request,
+#   concurrent.futures (ThreadPoolExecutor, as_completed),
+#   datetime, getpass, ctypes（仅 Windows 控制台启用 ANSI 转义时使用）
+#
+# 说明：早先注释里提到的 requests / pandas / beautifulsoup4 / markdownify
+# 均未在代码中使用，已移除。
